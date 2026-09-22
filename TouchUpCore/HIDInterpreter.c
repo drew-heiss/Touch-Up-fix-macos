@@ -13,6 +13,7 @@
 #include <IOKit/hid/IOHIDManager.h>
 
 #include <CoreGraphics/CoreGraphics.h>
+#include <dispatch/dispatch.h>
 
 #pragma mark - Per-Device State
 
@@ -661,10 +662,96 @@ static CFIndex CountContactCollections(IOHIDDeviceRef dev) {
 
 
 
+// Match the standard Device Configuration report by its HID usages, not a
+// controller name or report ID. Only the known two-field layout is initialized.
+static IOHIDElementRef DeviceIdentifierForMode(CFArrayRef elements, IOHIDElementRef mode) {
+    if (IOHIDElementGetType(mode) != kIOHIDElementTypeFeature ||
+        IOHIDElementGetUsagePage(mode) != kHIDPage_Digitizer ||
+        IOHIDElementGetUsage(mode) != kHIDUsage_Dig_DeviceMode ||
+        IOHIDElementGetReportSize(mode) != 8 || IOHIDElementGetReportCount(mode) != 1 ||
+        IOHIDElementGetLogicalMin(mode) > 2 || IOHIDElementGetLogicalMax(mode) < 2) return NULL;
+
+    IOHIDElementRef settings = IOHIDElementGetParent(mode);
+    IOHIDElementRef application = settings ? IOHIDElementGetParent(settings) : NULL;
+    if (!application || IOHIDElementGetType(application) != kIOHIDElementTypeCollection ||
+        IOHIDElementGetCollectionType(application) != kIOHIDElementCollectionTypeApplication ||
+        IOHIDElementGetUsagePage(application) != kHIDPage_Digitizer ||
+        IOHIDElementGetUsage(application) != kHIDUsage_Dig_DeviceConfiguration ||
+        IOHIDElementGetType(settings) != kIOHIDElementTypeCollection ||
+        IOHIDElementGetCollectionType(settings) != kIOHIDElementCollectionTypeLogical ||
+        IOHIDElementGetUsagePage(settings) != kHIDPage_Digitizer ||
+        IOHIDElementGetUsage(settings) != kHIDUsage_Dig_DeviceSettings) return NULL;
+
+    IOHIDElementRef identifier = NULL;
+    CFIndex fields = 0;
+    for (CFIndex i = 0; i < CFArrayGetCount(elements); i++) {
+        IOHIDElementRef element = (IOHIDElementRef)CFArrayGetValueAtIndex(elements, i);
+        if (IOHIDElementGetType(element) != kIOHIDElementTypeFeature ||
+            IOHIDElementGetReportID(element) != IOHIDElementGetReportID(mode)) continue;
+        fields++;
+        if (IOHIDElementGetParent(element) == settings &&
+            IOHIDElementGetUsagePage(element) == kHIDPage_Digitizer &&
+            IOHIDElementGetUsage(element) == kHIDUsage_Dig_DeviceIdentifier &&
+            IOHIDElementGetReportSize(element) == 8 && IOHIDElementGetReportCount(element) == 1) {
+            identifier = element;
+        }
+    }
+    return fields == 2 ? identifier : NULL;
+}
+
+static void InitializeTouchscreenMode(void *context) {
+    // The retained device survives unplugging while a synchronous request is in
+    // flight. This worker never refers to the movable per-device state array.
+    IOHIDDeviceRef device = (IOHIDDeviceRef)context;
+    CFArrayRef elements = IOHIDDeviceCopyMatchingElements(device, NULL, kIOHIDOptionsTypeNone);
+    if (elements) {
+        for (CFIndex i = 0; i < CFArrayGetCount(elements); i++) {
+            IOHIDElementRef mode = (IOHIDElementRef)CFArrayGetValueAtIndex(elements, i);
+            IOHIDElementRef identifier = DeviceIdentifierForMode(elements, mode);
+            if (!identifier) continue;
+
+            // Preserve the selector returned by the device. IOKit handles field
+            // offsets and report IDs when composing the feature report.
+            IOHIDValueRef identifierValue = NULL;
+            IOReturn result = IOHIDDeviceGetValueWithOptions(device, identifier, &identifierValue,
+                                                           kIOHIDDeviceGetValueWithUpdate);
+            if (result != kIOReturnSuccess || !identifierValue || IOHIDValueGetLength(identifierValue) > 8) {
+                fprintf(stderr, "Could not read touchscreen Device Identifier: 0x%08x\n", result);
+                continue;
+            }
+            // Send the SET even when a GET already reports mode 2: CoolTouch
+            // remains on its mouse interface until it receives this initialization.
+            // Mode 2 is the standard Windows multiple-input mode:
+            // https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/using-report-descriptors-to-support-capability-discovery
+            IOHIDValueRef modeValue = IOHIDValueCreateWithIntegerValue(kCFAllocatorDefault, mode, 0, 2);
+            if (!modeValue) continue;
+            const void *keys[] = { mode, identifier };
+            const void *values[] = { modeValue, identifierValue };
+            CFDictionaryRef updates = CFDictionaryCreate(kCFAllocatorDefault, keys, values, 2,
+                                                        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            if (updates) {
+                result = IOHIDDeviceSetValueMultiple(device, updates);
+                fprintf(stderr, "Touchscreen %p: set Device Mode=2 (report 0x%02x), result=0x%08x\n",
+                        (void *)device, IOHIDElementGetReportID(mode), result);
+                CFRelease(updates);
+            }
+            CFRelease(modeValue);
+        }
+        CFRelease(elements);
+    }
+    CFRelease(device);
+}
+
+
 // Allocates device state and wires up the queue + input callbacks for an interface we've
 // decided to treat as the active touchscreen. The callback context is the device ref so
 // callbacks resolve to the right per-interface state even when locationIDs collide.
 static HIDDeviceState* RegisterTouchDevice(IOHIDDeviceRef dev, uint32_t locationID, CFIndex contactCount) {
+    IOReturn result = IOHIDDeviceOpen(dev, kIOHIDOptionsTypeNone);
+    if (result != kIOReturnSuccess) {
+        fprintf(stderr, "Could not open touchscreen 0x%08x: 0x%08x (check Input Monitoring permission)\n", locationID, result);
+        return NULL;
+    }
     HIDDeviceState *device = AllocateDeviceState(dev, locationID);
     if (!device) return NULL;
     device->contactCollectionCount = contactCount;
@@ -672,6 +759,11 @@ static HIDDeviceState* RegisterTouchDevice(IOHIDDeviceRef dev, uint32_t location
     void *context = (void *)dev;
 
     IOHIDQueueRef queue = IOHIDQueueCreate(kCFAllocatorDefault, dev, 1000, kNilOptions);
+    if (!queue) {
+        fprintf(stderr, "Could not create input queue for touchscreen 0x%08x\n", locationID);
+        DeallocateDeviceState(dev);
+        return NULL;
+    }
     IOHIDQueueRegisterValueAvailableCallback(queue, Handle_QueueValueAvailable, context);
     IOHIDQueueStart(queue);
     device->queue = queue;
@@ -680,6 +772,9 @@ static HIDDeviceState* RegisterTouchDevice(IOHIDDeviceRef dev, uint32_t location
     IOHIDDeviceRegisterInputValueCallback(dev, Handle_InputValueCallback, context);
 
     ApplySeizeState(device);
+    // Install callbacks before enabling reports; feature I/O must not block UI input.
+    dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                     (void *)CFRetain(dev), InitializeTouchscreenMode);
     return device;
 }
 
